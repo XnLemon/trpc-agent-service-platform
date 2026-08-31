@@ -1,154 +1,169 @@
-# 基于 tRPC-Agent-Go 设计多租户节点化 Agent 部署平台
+<div align="center">
+  <h1>tRPC Agent Service</h1>
+  <p>面向生产落地的多租户、节点化 Agent 部署平台</p>
 
-## 背景和价值
+  <p>
+    <a href="https://github.com/XnLemon/trpc-agent-service/actions/workflows/ci.yml"><img src="https://github.com/XnLemon/trpc-agent-service/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+    <a href="https://github.com/XnLemon/trpc-agent-service/actions/workflows/docs.yml"><img src="https://github.com/XnLemon/trpc-agent-service/actions/workflows/docs.yml/badge.svg?branch=main" alt="Docs"></a>
+    <a href="https://codecov.io/gh/XnLemon/trpc-agent-service"><img src="https://codecov.io/gh/XnLemon/trpc-agent-service/branch/main/graph/badge.svg" alt="Codecov"></a>
+    <a href="https://github.com/XnLemon/trpc-agent-service/actions/workflows/publish-image.yml"><img src="https://github.com/XnLemon/trpc-agent-service/actions/workflows/publish-image.yml/badge.svg" alt="Container image"></a>
+  </p>
+</div>
 
-企业在落地 Agent 应用时，通常不会只部署一个单体机器人，而是希望面向多个部门、多个业务线、多个 IM 入口和多个数据后端，构建一套可统一管理的 Agent 平台。例如：客服团队希望把 Agent 接入企业微信，研发团队希望接入内部群机器人，运营团队希望接入微信公众号或微信客服，不同租户又需要隔离会话、记忆、知识库、工具权限和审计日志。
+**tRPC Agent Service** 将 [tRPC-Agent-Go](https://github.com/trpc-group/trpc-agent-go) 的 Agent、Runner、Tool 和 Session 能力装配成一个可部署的平台服务。它把租户、Agent 应用、模型、数据后端和 IM 通道纳入同一套受控配置，并通过版本化执行快照、共享运行时状态、幂等和可观测性支撑多节点运行。
 
-[tRPC-Agent-Go](https://github.com/trpc-group/trpc-agent-go) 已经具备 Agent 编排（LLMAgent / GraphAgent / Chain / Parallel / Cycle）、Tool / MCP、Session、Memory、Knowledge、Artifact、Plugin / Guardrail、Telemetry、HTTP 服务化（OpenAI-compatible / AG-UI / A2A）、OpenClaw / IM 通道等能力。该题要求基于这些能力设计一个“多租户、可节点化部署、支持多后端数据同步、可接入微信 / 企业微信等 IM 软件”的生产级方案。
+它适合希望把单个 Agent 原型演进为团队或企业服务的场景：对话 API、企业微信/Telegram 接入、按租户的配置与审计，以及 Docker Compose 和 Kubernetes 部署都由同一套平台边界承载。
 
-这个题目解决的业务痛点是：企业希望把 Agent 能力从单点 demo 扩展成平台化服务，同时满足租户隔离、弹性部署、数据一致性、IM 触达、审计合规和后端可替换等要求。它的价值在于把框架能力真正映射到企业级 Agent 平台架构，而不是只停留在单个 Agent 进程。
+## 为什么使用它
 
-本题以 **tRPC-Agent-Go** 为实现框架，对称于基于 tRPC-Agent-Python 的同名题目。
+- **多租户控制面**：Tenant、Agent App、Revision、Model Profile、Backend Profile 和 Channel Binding 均有明确的租户边界、版本和状态迁移规则。
+- **无状态 Agent Worker**：Gateway 负责鉴权、路由、限流、幂等和执行计划；Worker 使用共享 Session/Event/Outbox 状态，可以独立扩展和恢复。
+- **安全的配置链路**：控制面只保存无密钥配置和 `secret_ref`；模型密钥、IM 凭据和数据库连接信息在受控 resolver 边界注入，不进入快照、日志或 trace。
+- **可演进的运行时**：Model/Backend/Channel 使用 provider registry 和 capability adapter，配置发布、回滚、灰度和缓存失效保持可审计。
+- **服务化入口**：提供普通 `/v1/chat`、SSE `/v1/chat/stream`、Admin API、健康检查和 readiness；企业微信与 Telegram 适配器复用同一 Gateway 执行链路。
+- **可观测与可运维**：贯穿请求、模型、工具、存储和回复投递的 trace、metrics、结构化日志、Outbox 重试和死信边界。
 
-### 任务描述
+## 架构总览
 
-请设计一个基于 tRPC-Agent-Go 的多租户节点化 Agent 部署平台。平台需要支持多个租户创建和部署自己的 Agent，每个租户可以绑定不同 IM 通道、选择不同数据后端、配置不同工具权限和知识库，并允许多个 Agent 节点水平扩展。系统需要考虑跨节点会话路由、数据同步、后端适配、IM 消息接入、监控审计和故障恢复。
+控制面管理“允许执行什么”，数据面处理“现在执行什么”。一次请求在建立可信租户主体后，加载不可变的 `ExecutionPlan`，再交给 Runner/Agent/Tool 和租户作用域的存储能力。
 
-本题以架构设计为主，可以包含少量关键 Go 伪代码、接口定义或数据模型示例。不要求实现完整系统，但方案必须足够具体，能指导后续工程落地。
+![tRPC Agent Service production architecture](docs/docs/assets/architecture-overview.png)
 
-## 具体要求
-
-### 多租户与节点部署
-
-- 设计租户模型，至少包含 `tenant_id`、应用配置、模型配置、工具权限、IM 通道配置、数据后端配置、审计策略。
-- 设计节点部署拓扑，说明 Agent Gateway、Agent Worker、Channel Adapter、Storage Adapter、Admin API、Telemetry Collector 等组件如何协作。可对照 tRPC-Agent-Go 中的 `runner.Runner`、`server/*`、`openclaw` Gateway 与 Channel 的职责划分。
-- 支持多节点水平扩展，说明用户消息如何路由到正确租户和正确 session。
-- 说明是否需要 sticky session；如果不需要，说明如何依赖共享 Session / Memory 后端（例如 `session/redis`、`session/mysql`、`session/postgres`）实现无状态 Worker。
-- 设计租户隔离机制，包括配置隔离、数据隔离、工具权限隔离、日志脱敏和密钥管理。
-
-### 数据同步与多后端支持
-
-- 支持不同租户选择不同数据后端，例如 InMemory、Redis、SQL、向量库、对象存储或外部 Memory 服务。tRPC-Agent-Go 已提供 Session（inmemory / redis / mysql / postgres / sqlite / mongodb 等）、Memory、Knowledge、Artifact 以及 `storage`（redis / mysql / postgres / s3 / qdrant / milvus 等）适配，方案需说明如何在平台层做租户级选择与路由。
-- 设计统一的数据访问抽象，说明 Session、Memory、Summary、Artifact、Knowledge、Audit Log 分别如何存储。
-- 设计数据同步策略，至少覆盖：
-  - 多节点并发写入同一 session 的一致性。
-  - Session event、state、summary 的更新顺序。
-  - Memory 写入后的跨节点可见性。
-  - 后端从 Redis 迁移到 SQL 或从本地向量库迁移到远端向量库时的数据迁移方案。
-  - IM 消息重复投递时的幂等处理。
-- 说明不同后端的一致性取舍，例如强一致、最终一致、读写延迟、成本和运维复杂度。
-- 给出一个最小数据模型或表结构示例，至少包含 tenant、agent app、session、message/event、memory、summary、channel binding、audit log。
-
-### IM 软件接入
-
-- 设计 IM Channel Adapter，支持企业微信、微信客服、微信公众号、Telegram 或其他 IM 通道中的至少两类。可复用并扩展 tRPC-Agent-Go 的 OpenClaw Channel 模型。
-- 说明外部 IM 消息如何转换为 tRPC-Agent-Go 的用户输入（`model.Message` / `runner.Runner.Run`），Agent Event 如何转换为 IM 回复、流式消息或卡片消息。
-- 设计 IM 账号和租户绑定方式，包括 webhook URL、token、secret、回调验签、消息去重、用户身份映射。
-- 说明群聊和单聊的 `session_id` 生成规则，以及用户跨群、跨租户时的隔离策略。
-- 考虑 IM 平台限制，例如消息长度、频率限制、异步回复、图片 / 文件消息、撤回或失败重试。
-
-### 治理、监控和安全
-
-- 使用 Plugin / Guardrail / Callbacks 设计租户级治理策略，例如工具白名单、敏感信息脱敏、预算限制、危险工具二次确认、IM 用户权限校验。
-- 设计监控指标，例如请求量、模型调用耗时、工具调用耗时、IM 投递成功率、错误率、token 消耗、每租户成本、Session 后端延迟。
-- 说明如何接入 OpenTelemetry 或等价 tracing，要求 trace 能串起 IM callback、Runner 执行、Tool 调用、Session / Memory 读写和 IM 回复。
-- 设计审计日志字段，至少包含 `tenant_id`、`channel`、`user_id`、`session_id`、`agent_name`、`tool_name`、`decision`、`latency`、`error_type`、`cost`、`trace_id`。
-- 说明密钥管理和脱敏策略，IM token、模型 API key、数据库密码不能明文出现在日志、trace 或错误报告中。
-
-### 故障恢复与运维
-
-- 设计节点故障、IM 重试、数据库短暂不可用、模型超时、工具执行失败时的降级策略。Go 侧需同时说明 `context.Context` 取消、goroutine 生命周期和 Runner 事件通道排空，避免泄漏。
-- 说明如何做灰度发布和租户级配置回滚。
-- 说明如何做容量评估，例如每节点并发 session 数、平均 token 消耗、Redis / SQL QPS、IM 回调峰值。
-- 设计最小可运行部署方案和生产推荐部署方案，可以使用 Docker Compose、Kubernetes 或等价部署方式描述。
-
-### 交付物
-
-- 一份架构设计文档，建议 2000 – 4000 字。
-- 一张系统架构图，展示 Gateway、Worker、Channel Adapter、Storage Adapter、Plugin / Guardrail、Telemetry、数据库和 IM 平台之间的关系。
-- 一张核心时序图，展示“企业微信用户发消息 → Agent 执行 → Tool 调用 → Session / Memory 写入 → IM 回复”的完整链路。
-- 一份数据模型设计，包含核心表结构或 JSON schema。
-- 一份数据同步和幂等策略说明。
-- 一份多后端适配方案，说明 Redis / SQL / 向量库 / 对象存储分别适合存什么。
-- 一份风险清单，列出至少 8 个生产风险及对应缓解措施。
-- 一份基于该设计的 GitHub 实现代码。
-
-## 题目难点
-
-- 多租户隔离不是只加一个 `tenant_id` 字段，还涉及配置、权限、密钥、数据、日志、工具和成本隔离。
-- 节点化部署要求 Agent Worker 尽量无状态，但 Agent 又天然依赖 Session、Memory、Summary 和工具上下文，需要设计可靠的共享状态层。
-- IM 通道存在消息乱序、重复投递、响应超时、长度限制和身份映射问题，不能简单等同于 HTTP chat API。
-- 不同后端的数据一致性能力不同，Redis、SQL、向量库、对象存储无法用同一种同步策略处理。
-- Agent 执行链路包含模型、工具、MCP、知识库、沙箱和外部系统，监控和审计必须跨组件串联。
-- 企业级平台必须考虑灰度、回滚、租户级限流、成本控制和合规审计。
-
-## 验收标准
-
-1. 架构方案必须覆盖多租户、节点化部署、数据同步、多后端支持、IM 接入、治理监控和故障恢复。
-2. 数据模型必须能表达 tenant、agent、channel binding、session、event、memory、summary、audit log 的关系。
-3. 必须说明至少两种 IM 通道的接入差异，其中至少包含微信或企业微信。
-4. 必须说明至少三类后端的数据存储和同步策略，例如 Redis、SQL、向量库或对象存储。
-5. 必须给出一条完整消息链路的时序说明，包含 `trace_id` 或 `request_id` 如何贯穿链路。
-6. 必须列出至少 8 个生产风险和缓解措施。
-7. 方案需要明确哪些能力可直接复用 tRPC-Agent-Go，哪些需要新增平台层模块。
-
-## 可直接复用的 tRPC-Agent-Go 能力对照
-
-| 平台需求 | 可复用的框架能力 | 需要新增的平台层 |
-| --- | --- | --- |
-| Agent 编排 | `agent/llmagent`、`agent/graph`、Chain / Parallel / Cycle | 租户级 Agent 注册、发布与路由 |
-| 执行入口 | `runner.Runner`（流式 Event、context 取消） | 多租户 Worker 调度、无状态水平扩展 |
-| Session / Memory / Artifact / Knowledge | `session`、`memory`、`artifact`、`knowledge` 及多后端实现 | 租户级后端选择、数据隔离与迁移 |
-| Tool / MCP / Skill | `tool`、MCP Tool、`skill` | 租户工具白名单与密钥注入 |
-| 治理 | Plugin / Guardrail / Callbacks | 租户策略下发、预算与审批 |
-| 服务化 | `server/openai`、`server/agui`、`server/a2a`、`server/trpcagent` | 统一 Gateway、Admin API |
-| IM 接入 | OpenClaw Gateway + Channel | 微信 / 企业微信等通道与租户绑定 |
-| 可观测性 | OpenTelemetry tracing / metrics | 租户维度审计、成本与合规 |
-
-## 代码目录
-
-下面只是一个示范目录，用来说明平台需要覆盖的职责分层。实现时不必严格按这个结构组织代码，只要模块边界清晰、能对应到设计方案即可。
-
-```txt
-|-- README.md              # 说明文档，包含设计、安装、使用
-|-- go.mod                 # Go module 定义
-|-- build.sh               # 构建项目
-|-- clean.sh               # 清理中间产物
-|-- coverage.sh            # 运行单测覆盖率
-|-- format.sh              # 格式化 Go 代码
-|-- lint.sh                # 静态检查
-|-- start.sh               # 启动服务
-|-- stop.sh                # 停止服务
-|-- data                   # 服务运行时数据
-|-- docs                   # 各模块说明与架构设计文档
-|-- cmd
-|   `-- trpc-service       # 命令行入口，可直接启动服务
-`-- trpcservice            # 源码
-    |-- agent              # 基于 tRPC-Agent-Go 的 Agent 定义
-    |-- channels           # 对接 IM 的 Channel Adapter
-    |-- config             # 租户与节点配置
-    |-- log                # 日志级别与脱敏
-    |-- metrics            # 监控指标
-    |-- skill              # 可运行的 Skill
-    |-- tenant             # 多租户模型与隔离
-    |-- tool               # 平台 Tool
-    |-- version.go         # 版本信息
-    |-- web                # 管理 / 对话页面
-    `-- workspace          # 工作目录，包含本地、容器等沙箱环境
+```text
+Admin API -> SQL Control Plane -> Registry / Cache -> Execution Plan
+                                                     |
+IM / HTTP -> Channel Adapter -> Gateway -> Queue/Outbox -> Agent Worker
+                                                     |
+                                    Runner -> Model / Tool / Guardrail
+                                                     |
+                         Session / Event / Memory / Knowledge / Artifact / Audit
 ```
 
-## 快速开始
+详细的组件职责、可信路由和消息时序见[生产架构设计](docs/docs/architecture.md)。
+
+## 当前能力
+
+当前仓库提供一条可运行的服务骨架和完整的控制面纵向链路：
+
+- PostgreSQL 控制面、migration、显式 `init` 初始化和受认证的 Admin API；
+- Tenant/App/Revision 的草稿、发布、回滚、灰度候选和乐观锁；
+- OpenAI 模型 provider，以及不访问外部服务的 deterministic fake provider；
+- InMemory 与 PostgreSQL runtime storage、Session/Event、Reply Outbox 和租约恢复；
+- 普通及流式 HTTP Chat API，企业微信自建应用文本 webhook，Telegram 文本 long polling；
+- OpenTelemetry trace/metrics、Prometheus 导出路径、审计事件和脱敏错误；
+- Docker Compose 本地验证、Kubernetes Kustomize base，以及版本 tag 触发的 GHCR 镜像发布。
+
+以下能力仍不是当前默认生产路径：Redis 或独立向量/对象存储 provider 的完整装配、IM 媒体与 rich update、完整 Plugin/Guardrail 治理链、容量压测、备份恢复和故障演练。它们的设计边界和后续路线记录在专项文档中。
+
+## 快速开始：离线 Golden Path
+
+该路径使用 PostgreSQL、fake model 和固定响应验证从空数据库到第一条对话，不需要 OpenAI、IM 或 Secret Manager 凭据。
 
 ```bash
-git clone https://github.com/liuzengh/trpc-agent-service.git
+git clone https://github.com/XnLemon/trpc-agent-service.git
 cd trpc-agent-service
 
-./build.sh
-./start.sh
+./scripts/quickstart.sh --demo
 ```
 
-停止服务：
+脚本会构建镜像、启动 PostgreSQL、幂等创建 Tenant/App/Model/Backend/Revision，等待 `/healthz` 和 `/readyz`，然后实际调用 `/v1/chat`。成功响应为：
+
+```json
+{
+  "text": "Hello from the tRPC Agent Service demo.",
+  "status": "complete",
+  "done": true
+}
+```
+
+发送一条自己的请求：
 
 ```bash
-./stop.sh
+body='{"content":"hello from the local golden path","external_user_id":"quickstart-user","conversation_kind":"direct","external_peer_id":"quickstart"}'
+api_token="${TRPC_API_TOKEN:-local-api-token}"
+
+curl -i \
+  -H "Authorization: Bearer ${api_token}" \
+  -H 'Content-Type: application/json' \
+  --data "$body" \
+  http://127.0.0.1:8080/v1/chat
 ```
+
+`--demo` 是开发验收入口，不会自动替代真实部署。Windows/WSL、Docker 清理和完整验证说明见[部署、配置与快速开始](docs/docs/deployment.md)。
+
+## 真实模型与生产部署
+
+真实部署遵循“显式初始化 → Admin API 配置 → 发布 Revision → 正常启动”的顺序：
+
+1. 准备 PostgreSQL、模型 provider、API/Admin token 和 Secret 管理方案；
+2. 使用 `trpc-service init --confirm` 创建首个 Tenant 和 draft App；
+3. 通过 Admin API 创建 Model Profile、Backend Profile 和 Agent Revision，并发布 Revision；
+4. 将生成的 Tenant/App ID 和运行时凭据注入服务，启动非 demo 模式；
+5. 通过 `/readyz`、普通 API 和审计/metrics 验证服务。
+
+准备好 Secret、已发布的镜像 tag/digest 和 Kubernetes overlay 后：
+
+```bash
+# 生产镜像由版本 tag 触发 .github/workflows/publish-image.yml 发布到 GHCR。
+# Kubernetes 部署使用已发布的 tag 或 digest，不要使用本地 CI 镜像名。
+kubectl apply -k deploy/kubernetes
+```
+
+从零配置、Secret 约束、Kubernetes overlay 和 Admin API 字段见[部署文档](docs/docs/deployment.md)与[首次运行初始化](docs/docs/issue-67-first-run-init.md)。
+
+## 可观测性
+
+运行时 dashboard、trace 和 metrics 示例位于 `docs/docs/assets/issue-88/`：
+
+| Metrics | Runtime dashboard | Trace |
+| --- | --- | --- |
+| ![metrics](docs/docs/assets/issue-88/metrics-explore.png) | ![runtime dashboard](docs/docs/assets/issue-88/runtime-dashboard.png) | ![trace](docs/docs/assets/issue-88/trace-explore.png) |
+
+这些截图对应[生产可观测性文档](docs/docs/issue-79-observability.md)和 [Prometheus 说明](docs/docs/issue-88-prometheus.md)。
+
+## 项目结构
+
+```text
+cmd/trpc-service/       CLI：init、demo 和服务进程
+trpcservice/bootstrap/  数据库、provider、runtime 和 HTTP 装配
+trpcservice/tenant/     多租户模型与 repository
+trpcservice/agent/      Agent App、Revision 与发布
+trpcservice/model/      Model Profile、Secret Resolver、Factory
+trpcservice/backend/    Backend Profile、Capability Registry/Factory
+trpcservice/gateway/    鉴权、路由、Execution Plan、HTTP/SSE
+trpcservice/channels/   Telegram、企业微信 Channel Adapter
+trpcservice/runtime/    Session、Event、Queue、Outbox、Storage
+trpcservice/admin/      Admin API 与管理员认证
+migrations/             PostgreSQL/MySQL schema 与 migration
+deploy/                 Compose、Kubernetes、OTel/Prometheus 配置
+examples/               fault-injection、Telegram、WeCom E2E
+docs/                   架构、协议、运维和验收文档
+```
+
+## 开发与验证
+
+需要 Go 1.21 或更高版本。常用本地检查：
+
+```bash
+go test ./... -count=1
+go test -race ./... -count=1
+go vet ./...
+go build ./...
+python -m mkdocs build --strict -f docs/mkdocs.yml
+```
+
+CI 在 push/PR 时执行格式、静态检查、测试、覆盖率、race 和部署 smoke test；故障注入、Telegram live E2E、WeCom E2E 和文档构建有独立 workflow。提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 文档导航
+
+- [生产架构设计](docs/docs/architecture.md)：控制面、数据面、可信路由、执行计划和恢复模型
+- [部署、配置与快速开始](docs/docs/deployment.md)：Compose、Kubernetes、环境变量和 GHCR 镜像
+- [首次运行初始化](docs/docs/issue-67-first-run-init.md)：`trpc-service init` 与幂等边界
+- [Gateway、Execution Plan 与 HTTP/SSE](docs/docs/gateway.md)：请求契约、鉴权、限流和流式响应
+- [PostgreSQL 控制面与启动装配](docs/docs/postgresql-control-plane.md)：migration、repository 和 bootstrap
+- [原始任务书](docs/docs/project-brief.md)：项目最初的背景、要求、交付物和验收标准
+- [完整文档站](https://xnlemon.github.io/trpc-agent-service/)
+
+## 许可证
+
+本仓库当前未附带正式许可证文件；在将代码用于外部发布或商业部署前，请先确认项目维护者的授权范围。
