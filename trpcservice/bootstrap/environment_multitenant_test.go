@@ -1,0 +1,580 @@
+package bootstrap
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"testing"
+
+	"github.com/XnLemon/trpc-agent-service/trpcservice/backend"
+	"github.com/XnLemon/trpc-agent-service/trpcservice/channels"
+	"github.com/XnLemon/trpc-agent-service/trpcservice/gateway"
+	modelprofile "github.com/XnLemon/trpc-agent-service/trpcservice/model"
+	runtimesessionpostgres "github.com/XnLemon/trpc-agent-service/trpcservice/runtime/sessionpostgres"
+	runtimestorage "github.com/XnLemon/trpc-agent-service/trpcservice/runtime/storage"
+	runtimestorageinmemory "github.com/XnLemon/trpc-agent-service/trpcservice/runtime/storage/inmemory"
+	"github.com/XnLemon/trpc-agent-service/trpcservice/storage/postgres"
+	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+)
+
+func TestParseEnvironmentOTLPHeadersAndTelemetryBoundaries(t *testing.T) {
+	headers, err := parseEnvironmentOTLPHeaders("authorization=Bearer secret, x-tenant=platform")
+	if err != nil || headers["authorization"] != "Bearer secret" || headers["x-tenant"] != "platform" {
+		t.Fatalf("OTLP headers = %#v, %v", headers, err)
+	}
+	for _, invalid := range []string{"missing-equals", "=value", "key=", "key=value,key=other", "key=value\n"} {
+		if _, err := parseEnvironmentOTLPHeaders(invalid); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("invalid OTLP headers %q error = %v", invalid, err)
+		}
+	}
+	t.Setenv(envOTLPEndpoint, "http://collector:4318/v1/otlp")
+	t.Setenv(envOTLPHeaders, "authorization=Bearer secret")
+	t.Setenv(envOTLPInsecure, "true")
+	t.Setenv(envOTELServiceName, "service-test")
+	config := environmentConfig{}
+	if err := config.loadTelemetry(); err != nil {
+		t.Fatal(err)
+	}
+	if config.otlp.Endpoint != "http://collector:4318/v1/otlp" || !config.otlp.Insecure || config.otlp.Headers["authorization"] != "Bearer secret" || config.otlp.ServiceName != "service-test" {
+		t.Fatalf("OTLP config = %+v", config.otlp)
+	}
+	t.Setenv(envOTLPInsecure, "not-bool")
+	if err := config.loadTelemetry(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid OTLP insecure error = %v", err)
+	}
+	t.Setenv(envOTLPInsecure, "false")
+	t.Setenv(envOTELServiceName, "bad\nname")
+	if err := config.loadTelemetry(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid OTEL service name error = %v", err)
+	}
+}
+
+func TestParseEnvironmentAPIIdentities(t *testing.T) {
+	value := "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a, token-b|t_00000000000000000000000001|app_00000000000000000000000001|service-b"
+	identities, err := parseEnvironmentAPIIdentities(value)
+	if err != nil || len(identities) != 2 {
+		t.Fatalf("parse identities = %+v, %v", identities, err)
+	}
+	if identities["token-b"].TenantID != "t_00000000000000000000000001" {
+		t.Fatalf("second identity = %+v", identities["token-b"])
+	}
+	for _, invalid := range []string{"token|tenant|app", "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service,token-a|t_00000000000000000000000001|app_00000000000000000000000001|service", "token| |app|subject"} {
+		if _, err := parseEnvironmentAPIIdentities(invalid); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("invalid identities %q error = %v", invalid, err)
+		}
+	}
+}
+
+func TestLoadEnvironmentSupportsIdentityListWithoutFixedTenantFields(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envAPIIdentities, "")
+	t.Setenv(envAPIToken, "")
+	t.Setenv(envTenantID, "")
+	t.Setenv(envAppID, "")
+	t.Setenv(envModelAPIKey, "")
+	t.Setenv(envModelAPIKeys, "t_00000000000000000000000000=key-a,t_00000000000000000000000001=key-b")
+	t.Setenv(envAPIIdentities, "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a,token-b|t_00000000000000000000000001|app_00000000000000000000000001|service-b")
+	config, err := loadEnvironment()
+	if err != nil || len(config.apiIdentities) != 2 {
+		t.Fatalf("multi-tenant environment = %+v, %v", config, err)
+	}
+	if config.tenantID != "" || config.appID != "" {
+		t.Fatal("multi-tenant environment selected a process-fixed identity")
+	}
+	if _, err := gateway.NewStaticAPIAuthenticator(config.apiIdentities); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadEnvironmentUsesTenantModelAPIKeysForMultipleIdentities(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envAPIIdentities, "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a,token-b|t_00000000000000000000000001|app_00000000000000000000000001|service-b")
+	t.Setenv(envAPIToken, "")
+	t.Setenv(envTenantID, "")
+	t.Setenv(envAppID, "")
+	t.Setenv(envModelAPIKey, "")
+	t.Setenv(envModelAPIKeys, "t_00000000000000000000000000=key-a,t_00000000000000000000000001=key-b")
+	config, err := loadEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.modelAPIKey != "" || config.modelAPIKeys["t_00000000000000000000000000"] != "key-a" || config.modelAPIKeys["t_00000000000000000000000001"] != "key-b" {
+		t.Fatalf("tenant model keys = %#v, global=%q", config.modelAPIKeys, config.modelAPIKey)
+	}
+}
+
+func TestLoadEnvironmentUsesIdentityListForSingleFixedIdentity(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envAPIIdentities, "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a")
+	t.Setenv(envAPIToken, "")
+	t.Setenv(envTenantID, "")
+	t.Setenv(envAppID, "")
+	config, err := loadEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.tenantID != "t_00000000000000000000000000" || config.appID != "app_00000000000000000000000000" {
+		t.Fatalf("single identity fixed fields = %q/%q", config.tenantID, config.appID)
+	}
+}
+
+func TestEnvironmentRegistriesKeepModelSecretsTenantScoped(t *testing.T) {
+	const (
+		tenantA = "t_00000000000000000000000000"
+		tenantB = "t_00000000000000000000000001"
+	)
+	delegate := inmemory.NewSessionService()
+	store := runtimestorageinmemory.New()
+	defer func() {
+		_ = delegate.Close()
+		_ = store.Close()
+	}()
+	config := environmentConfig{
+		apiIdentities: map[string]gateway.APIIdentity{
+			"token-a": {TenantID: tenantA, AppID: "app-a", SubjectID: "subject-a"},
+			"token-b": {TenantID: tenantB, AppID: "app-b", SubjectID: "subject-b"},
+		},
+		modelAPIKeys:  map[string]string{tenantA: "key-a", tenantB: "key-b"},
+		modelProvider: defaultModelProvider,
+		secretRef:     "env/model",
+	}
+	secrets, models, backends, err := environmentRegistries(config, delegate, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for tenantID, want := range map[string]string{tenantA: "key-a", tenantB: "key-b"} {
+		value, resolveErr := secrets.Resolve(context.Background(), modelprofile.SecretScope{TenantID: tenantID, SecretRef: config.secretRef})
+		if resolveErr != nil || value.Value() != want {
+			t.Fatalf("tenant %s model secret = %q, %v", tenantID, value.Value(), resolveErr)
+		}
+	}
+	modelSecret, err := secrets.Resolve(context.Background(), modelprofile.SecretScope{TenantID: tenantA, SecretRef: config.secretRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := models.New(context.Background(), modelprofile.ModelFactoryInput{TenantID: tenantA, Provider: defaultModelProvider, Model: "gpt-4o-mini"}, modelSecret); err != nil {
+		t.Fatalf("tenant model registry = %v", err)
+	}
+	if _, err := backend.NewRegistryStorageFactory(backends, secrets); err != nil {
+		t.Fatalf("tenant backend registry = %v", err)
+	}
+}
+
+func TestEnvironmentRegistriesRejectMissingTenantModelKey(t *testing.T) {
+	delegate := inmemory.NewSessionService()
+	store := runtimestorageinmemory.New()
+	defer func() {
+		_ = delegate.Close()
+		_ = store.Close()
+	}()
+	_, _, _, err := environmentRegistries(environmentConfig{
+		apiIdentities: map[string]gateway.APIIdentity{"token": {TenantID: "t_00000000000000000000000000", AppID: "app", SubjectID: "subject"}},
+		modelAPIKeys:  map[string]string{},
+	}, delegate, store)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("missing tenant model key = %v", err)
+	}
+}
+
+func TestParseEnvironmentModelAPIKeysRejectsMalformedOrDuplicateEntries(t *testing.T) {
+	for _, value := range []string{"", ",", "tenant=", "=key", "tenant\n=key", "tenant=one,tenant=two"} {
+		if _, err := parseEnvironmentModelAPIKeys(value); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("parse %q error = %v", value, err)
+		}
+	}
+	keys, err := parseEnvironmentModelAPIKeys("tenant-a=key-a, tenant-b=key-b")
+	if err != nil || keys["tenant-a"] != "key-a" || keys["tenant-b"] != "key-b" {
+		t.Fatalf("parsed model keys = %#v, err=%v", keys, err)
+	}
+}
+
+func TestLoadEnvironmentRequiresEveryTenantModelAPIKey(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envAPIIdentities, "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a,token-b|t_00000000000000000000000001|app_00000000000000000000000001|service-b")
+	t.Setenv(envAPIToken, "")
+	t.Setenv(envTenantID, "")
+	t.Setenv(envAppID, "")
+	t.Setenv(envModelAPIKey, "")
+	t.Setenv(envModelAPIKeys, "t_00000000000000000000000000=key-a")
+	if _, err := loadEnvironment(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("incomplete tenant model keys error = %v", err)
+	}
+}
+
+func TestLoadEnvironmentRejectsGlobalModelKeyForMultipleIdentities(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envAPIIdentities, "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a,token-b|t_00000000000000000000000001|app_00000000000000000000000001|service-b")
+	t.Setenv(envAPIToken, "")
+	t.Setenv(envTenantID, "")
+	t.Setenv(envAppID, "")
+	t.Setenv(envModelAPIKey, "shared-key")
+	t.Setenv(envModelAPIKeys, "")
+	if _, err := loadEnvironment(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("global model key in multi-tenant mode error = %v", err)
+	}
+}
+
+func TestLoadEnvironmentRejectsSingleWeComCredentialSetForMultipleIdentities(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envAPIIdentities, "token-a|t_00000000000000000000000000|app_00000000000000000000000000|service-a,token-b|t_00000000000000000000000001|app_00000000000000000000000001|service-b")
+	t.Setenv(envWeComCallbackToken, "callback")
+	t.Setenv(envWeComEncodingAESKey, "aes")
+	t.Setenv(envWeComAppSecret, "secret")
+	t.Setenv(envWeComSecretRef, "env/wecom")
+	if _, err := loadEnvironment(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("multi-identity WeCom config error = %v", err)
+	}
+}
+
+func TestEnvironmentCredentialResolversFailClosedByScope(t *testing.T) {
+	wecomResolver := environmentWeComCredentialResolver{tenantID: "t_00000000000000000000000000", config: environmentWeComConfig{callbackToken: "callback", encodingAESKey: "aes", appSecret: "app", secretRef: "env/wecom"}}
+	scope := channels.SecretScope{TenantID: "t_00000000000000000000000000", SecretRef: "env/wecom"}
+	credentials, err := wecomResolver.Resolve(context.Background(), scope)
+	if err != nil || credentials.CallbackToken != "callback" {
+		t.Fatalf("WeCom Resolve() = %+v, %v", credentials, err)
+	}
+	foreign := scope
+	foreign.TenantID = "t_00000000000000000000000001"
+	if _, err := wecomResolver.Resolve(context.Background(), foreign); err == nil {
+		t.Fatal("foreign WeCom scope was accepted")
+	}
+	if _, err := wecomResolver.Resolve(nil, scope); err == nil {
+		t.Fatal("nil WeCom context was accepted")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := wecomResolver.Resolve(canceled, scope); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled WeCom Resolve() = %v", err)
+	}
+
+	modelResolver := environmentSecretResolver{reference: "env/model", value: "model-secret"}
+	modelScope := modelprofile.SecretScope{TenantID: "t_00000000000000000000000000", SecretRef: "env/model"}
+	value, err := modelResolver.Resolve(context.Background(), modelScope)
+	if err != nil || value.Value() != "model-secret" {
+		t.Fatalf("model Resolve() = %q, %v", value.Value(), err)
+	}
+	modelScope.SecretRef = "other"
+	if _, err := modelResolver.Resolve(context.Background(), modelScope); err == nil {
+		t.Fatal("foreign model scope was accepted")
+	}
+}
+
+func TestEnvironmentSessionCapabilityProviderBoundaries(t *testing.T) {
+	provider := environmentSessionCapabilityProvider{}
+	if _, err := provider.New(nil, backend.StorageFactoryInput{TenantID: "t_00000000000000000000000000"}, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("nil provider context = %v", err)
+	}
+	store := runtimestorageinmemory.New()
+	delegate := inmemory.NewSessionService()
+	value, err := (environmentSessionCapabilityProvider{delegate: delegate, store: store}).New(context.Background(), backend.StorageFactoryInput{TenantID: "t_00000000000000000000000000"}, backend.CapabilityBinding{}, modelprofile.SecretValue{})
+	if err != nil || value == nil {
+		t.Fatalf("session capability = %v, %v", value, err)
+	}
+	if err := value.(interface{ Close() error }).Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = delegate.Close()
+	_ = store.Close()
+}
+
+func TestEnvironmentRuntimeCapabilityProviderNew(t *testing.T) {
+	const tenantID = "t_00000000000000000000000000"
+	store := runtimestorageinmemory.New()
+	delegate := inmemory.NewSessionService()
+	t.Cleanup(func() {
+		_ = delegate.Close()
+		_ = store.Close()
+	})
+	input := backend.StorageFactoryInput{TenantID: tenantID}
+
+	tests := []struct {
+		name       string
+		capability backend.Capability
+		matches    func(any) bool
+	}{
+		{name: "session", capability: backend.CapabilitySession, matches: func(value any) bool { _, ok := value.(*runtimesessionpostgres.Service); return ok }},
+		{name: "memory", capability: backend.CapabilityMemory, matches: func(value any) bool { _, ok := value.(borrowedMemoryStore); return ok }},
+		{name: "summary", capability: backend.CapabilitySummary, matches: func(value any) bool { _, ok := value.(borrowedSummaryStore); return ok }},
+		{name: "knowledge", capability: backend.CapabilityKnowledge, matches: func(value any) bool { _, ok := value.(borrowedKnowledgeStore); return ok }},
+		{name: "artifact", capability: backend.CapabilityArtifact, matches: func(value any) bool { _, ok := value.(borrowedArtifactStore); return ok }},
+		{name: "audit", capability: backend.CapabilityAudit, matches: func(value any) bool { _, ok := value.(borrowedAuditStore); return ok }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := (environmentRuntimeCapabilityProvider{capability: test.capability, delegate: delegate, store: store, backend: "inmemory"}).New(context.Background(), input, backend.CapabilityBinding{}, modelprofile.SecretValue{})
+			if err != nil || value == nil || !test.matches(value) {
+				t.Fatalf("capability value = %T, %v", value, err)
+			}
+			closer, ok := value.(interface{ Close() error })
+			if !ok {
+				t.Fatalf("capability %T does not expose Close", value)
+			}
+			if err := closer.Close(); err != nil {
+				t.Fatalf("borrowed capability close = %v", err)
+			}
+		})
+	}
+
+	if _, err := (environmentRuntimeCapabilityProvider{capability: backend.CapabilityMemory, store: store}).New(nil, input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("nil provider context = %v", err)
+	}
+	if _, err := (environmentRuntimeCapabilityProvider{capability: backend.CapabilitySession, delegate: delegate, store: store}).New(nil, input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("nil session context = %v", err)
+	}
+	for _, capability := range []backend.Capability{backend.CapabilityMemory, backend.CapabilitySummary, backend.CapabilityKnowledge, backend.CapabilityArtifact, backend.CapabilityAudit, backend.Capability("unknown")} {
+		if _, err := (environmentRuntimeCapabilityProvider{capability: capability}).New(context.Background(), input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, backend.ErrStorageFactory) {
+			t.Fatalf("missing %s store error = %v", capability, err)
+		}
+	}
+	if _, err := (environmentRuntimeCapabilityProvider{capability: backend.CapabilitySession, delegate: delegate}).New(context.Background(), input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, runtimestorage.ErrInvalid) {
+		t.Fatalf("invalid session dependencies error = %v", err)
+	}
+
+	knowledgeOnly := &environmentKnowledgeOnlyStore{RuntimeStore: store, knowledge: store}
+	if _, err := (environmentRuntimeCapabilityProvider{capability: backend.CapabilityKnowledge, store: knowledgeOnly}).New(context.Background(), input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, backend.ErrStorageFactory) {
+		t.Fatalf("missing vector store error = %v", err)
+	}
+	artifactOnly := &environmentArtifactOnlyStore{RuntimeStore: store, artifact: store}
+	if _, err := (environmentRuntimeCapabilityProvider{capability: backend.CapabilityArtifact, store: artifactOnly}).New(context.Background(), input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, backend.ErrStorageFactory) {
+		t.Fatalf("missing object store error = %v", err)
+	}
+	if _, err := (environmentRuntimeCapabilityProvider{capability: backend.Capability("unknown"), store: store}).New(context.Background(), input, backend.CapabilityBinding{}, modelprofile.SecretValue{}); !errors.Is(err, backend.ErrStorageFactory) {
+		t.Fatalf("unsupported capability error = %v", err)
+	}
+
+	if _, err := store.PutMemory(context.Background(), runtimestorage.MemoryInput{TenantID: tenantID, UserID: "user", Content: "content"}); err != nil {
+		t.Fatalf("borrowed capability close stopped shared store = %v", err)
+	}
+}
+
+type environmentKnowledgeOnlyStore struct {
+	runtimestorage.RuntimeStore
+	knowledge runtimestorage.KnowledgeStore
+}
+
+func (store *environmentKnowledgeOnlyStore) PutKnowledge(ctx context.Context, document runtimestorage.KnowledgeDocument) (runtimestorage.KnowledgeDocument, error) {
+	return store.knowledge.PutKnowledge(ctx, document)
+}
+
+func (store *environmentKnowledgeOnlyStore) GetKnowledge(ctx context.Context, tenantID, documentID string) (runtimestorage.KnowledgeDocument, error) {
+	return store.knowledge.GetKnowledge(ctx, tenantID, documentID)
+}
+
+func (store *environmentKnowledgeOnlyStore) SearchKnowledge(ctx context.Context, tenantID string, embedding []float64, limit int) ([]runtimestorage.KnowledgeSearchResult, error) {
+	return store.knowledge.SearchKnowledge(ctx, tenantID, embedding, limit)
+}
+
+func (store *environmentKnowledgeOnlyStore) DeleteKnowledge(ctx context.Context, tenantID, documentID string) error {
+	return store.knowledge.DeleteKnowledge(ctx, tenantID, documentID)
+}
+
+type environmentArtifactOnlyStore struct {
+	runtimestorage.RuntimeStore
+	artifact runtimestorage.ArtifactStore
+}
+
+func (store *environmentArtifactOnlyStore) PutArtifact(ctx context.Context, artifact runtimestorage.ArtifactRecord) (runtimestorage.ArtifactRecord, error) {
+	return store.artifact.PutArtifact(ctx, artifact)
+}
+
+func (store *environmentArtifactOnlyStore) GetArtifact(ctx context.Context, tenantID, artifactID string) (runtimestorage.ArtifactRecord, error) {
+	return store.artifact.GetArtifact(ctx, tenantID, artifactID)
+}
+
+func (store *environmentArtifactOnlyStore) ListArtifacts(ctx context.Context, tenantID, sessionID string) ([]runtimestorage.ArtifactRecord, error) {
+	return store.artifact.ListArtifacts(ctx, tenantID, sessionID)
+}
+
+func (store *environmentArtifactOnlyStore) DeleteArtifact(ctx context.Context, tenantID, artifactID string) error {
+	return store.artifact.DeleteArtifact(ctx, tenantID, artifactID)
+}
+
+func TestNewFromEnvironmentMigrationAndReadinessFailures(t *testing.T) {
+	setRequiredEnvironment(t)
+	registerBootstrapPingDriver.Do(func() {
+		sql.Register("trpc-service-bootstrap-ping", bootstrapPingDriver{})
+	})
+	previousOpen := openEnvironmentDatabase
+	previousApply := applyEnvironmentMigrations
+	previousVerify := verifyEnvironmentMigrations
+	defer func() {
+		openEnvironmentDatabase = previousOpen
+		applyEnvironmentMigrations = previousApply
+		verifyEnvironmentMigrations = previousVerify
+	}()
+	for _, test := range []struct {
+		name     string
+		applyErr error
+	}{
+		{name: "migration", applyErr: errors.New("migration failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := sql.Open("trpc-service-bootstrap-ping", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			openEnvironmentDatabase = func(context.Context, string, postgres.Options) (*sql.DB, error) { return db, nil }
+			applyEnvironmentMigrations = func(context.Context, *sql.DB) error { return test.applyErr }
+			verifyEnvironmentMigrations = func(context.Context, *sql.DB) error { return nil }
+			if _, err := NewFromEnvironment(context.Background()); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("migration error = %v", err)
+			}
+			_ = db.Close()
+		})
+	}
+
+	db, err := sql.Open("trpc-service-bootstrap-ping", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	openEnvironmentDatabase = func(context.Context, string, postgres.Options) (*sql.DB, error) { return db, nil }
+	applyEnvironmentMigrations = func(context.Context, *sql.DB) error { return nil }
+	verifyEnvironmentMigrations = func(context.Context, *sql.DB) error { return errors.New("verification failed") }
+	graph, err := NewFromEnvironment(context.Background())
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if graph.Ready() {
+		_ = graph.Close()
+		t.Fatal("graph reported ready with failed migration verification")
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnvironmentCatalogsAndIdentityListBoundaries(t *testing.T) {
+	config := environmentConfig{modelProvider: defaultModelProvider, modelNames: []string{"gpt-4o-mini"}, endpointHosts: []string{"api.openai.com"}, secretRef: "env/model"}
+	if _, _, err := environmentCatalogs(config); err != nil {
+		t.Fatal(err)
+	}
+	config.modelProvider = "unknown"
+	if _, _, err := environmentCatalogs(config); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("unsupported catalog = %v", err)
+	}
+	if _, err := parseEnvironmentAPIIdentities(""); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("empty identity list = %v", err)
+	}
+}
+
+func TestDemoEnvironmentConfigurationBranches(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envDemoMode, "not-bool")
+	if _, err := loadEnvironment(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid demo mode = %v", err)
+	}
+
+	t.Setenv(envDemoMode, "true")
+	t.Setenv(envModelProvider, demoModelProvider)
+	t.Setenv(envModelNames, ",")
+	config := environmentConfig{demoMode: true, modelProvider: demoModelProvider}
+	if err := config.loadModel(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid demo model list = %v", err)
+	}
+
+	config = environmentConfig{demoMode: true, driver: ControlPlaneDriverPostgres, runtimeStorage: "postgres"}
+	if err := config.loadRuntime(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("demo postgres runtime storage = %v", err)
+	}
+	config.driver = ControlPlaneDriverMySQL
+	config.runtimeStorage = "inmemory"
+	if err := config.loadRuntime(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("demo MySQL control plane = %v", err)
+	}
+
+	if _, _, err := environmentCatalogs(environmentConfig{demoMode: true, modelProvider: defaultModelProvider, modelNames: []string{demoModelName}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("demo production provider = %v", err)
+	}
+	if _, _, err := environmentCatalogs(environmentConfig{demoMode: true, modelProvider: demoModelProvider}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("empty demo model catalog = %v", err)
+	}
+
+	if value, err := environmentBool("TEST_DEMO_BOOL"); err != nil || value {
+		t.Fatalf("empty environment bool = %v, %v", value, err)
+	}
+	t.Setenv("TEST_DEMO_BOOL", "true")
+	if value, err := environmentBool("TEST_DEMO_BOOL"); err != nil || !value {
+		t.Fatalf("true environment bool = %v, %v", value, err)
+	}
+	t.Setenv("TEST_DEMO_BOOL", "false")
+	if value, err := environmentBool("TEST_DEMO_BOOL"); err != nil || value {
+		t.Fatalf("false environment bool = %v, %v", value, err)
+	}
+	t.Setenv("TEST_DEMO_BOOL", "invalid")
+	if _, err := environmentBool("TEST_DEMO_BOOL"); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid environment bool = %v", err)
+	}
+}
+
+func TestEnvironmentDemoRegistriesAreCredentialFree(t *testing.T) {
+	const tenantID = "t_00000000000000000000000000"
+	delegate := inmemory.NewSessionService()
+	store := runtimestorageinmemory.New()
+	t.Cleanup(func() {
+		_ = delegate.Close()
+		_ = store.Close()
+	})
+	config := environmentConfig{
+		demoMode: true, modelProvider: demoModelProvider, modelNames: []string{demoModelName}, runtimeStorage: "inmemory",
+		apiIdentities: map[string]gateway.APIIdentity{"demo-token": {TenantID: tenantID, AppID: "app_00000000000000000000000000", SubjectID: "demo"}},
+	}
+	secrets, models, backends, err := environmentRegistries(config, delegate, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.Resolve(context.Background(), modelprofile.SecretScope{TenantID: tenantID, SecretRef: "env/model"}); err == nil {
+		t.Fatal("demo registry unexpectedly stored a model secret")
+	}
+	model, err := models.New(context.Background(), modelprofile.ModelFactoryInput{TenantID: tenantID, Provider: demoModelProvider, Model: demoModelName}, modelprofile.SecretValue{})
+	if err != nil || model == nil || model.Info().Name != demoModelName {
+		t.Fatalf("demo model registry = %T, %v", model, err)
+	}
+	for _, capability := range []backend.Capability{backend.CapabilitySession, backend.CapabilityMemory, backend.CapabilitySummary, backend.CapabilityKnowledge, backend.CapabilityArtifact, backend.CapabilityAudit} {
+		provider, resolveErr := backends.Resolve(context.Background(), backend.StorageFactoryInput{TenantID: tenantID}, backend.CapabilityBinding{Capability: capability, Provider: "inmemory"})
+		if resolveErr != nil || provider == nil {
+			t.Fatalf("demo backend provider %s = %v", capability, resolveErr)
+		}
+	}
+	if _, _, _, err := environmentRegistries(environmentConfig{demoMode: true, modelProvider: demoModelProvider, apiIdentities: map[string]gateway.APIIdentity{"bad": {TenantID: "invalid", AppID: "app", SubjectID: "subject"}}}, delegate, store); err == nil {
+		t.Fatal("invalid demo tenant registration was accepted")
+	}
+}
+
+func TestNewFromEnvironmentBuildsDemoGraphWithoutCredentials(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv(envDemoMode, "true")
+	t.Setenv(envModelProvider, demoModelProvider)
+	t.Setenv(envModelAPIKey, "")
+	t.Setenv(envModelAPIKeys, "")
+	t.Setenv(envSessionBackend, "inmemory")
+	registerBootstrapPingDriver.Do(func() {
+		sql.Register("trpc-service-bootstrap-ping", bootstrapPingDriver{})
+	})
+	db, err := sql.Open("trpc-service-bootstrap-ping", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousOpen := openEnvironmentDatabase
+	previousApply := applyEnvironmentMigrations
+	previousVerify := verifyEnvironmentMigrations
+	openEnvironmentDatabase = func(context.Context, string, postgres.Options) (*sql.DB, error) { return db, nil }
+	applyEnvironmentMigrations = func(context.Context, *sql.DB) error { return nil }
+	verifyEnvironmentMigrations = func(context.Context, *sql.DB) error { return nil }
+	t.Cleanup(func() {
+		openEnvironmentDatabase = previousOpen
+		applyEnvironmentMigrations = previousApply
+		verifyEnvironmentMigrations = previousVerify
+		_ = db.Close()
+	})
+	graph, err := NewFromEnvironment(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !graph.Ready() {
+		t.Fatal("demo environment graph is not ready")
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
